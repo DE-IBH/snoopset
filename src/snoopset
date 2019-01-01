@@ -1,0 +1,232 @@
+#!/usr/bin/env perl
+
+# snoopset - DHCP snooping for ipset
+#
+# Authors:
+#   Thomas Liske <liske@ibh.de>
+#
+# Copyright Holder:
+#   2018 - 2019 (C) IBH IT-Service GmbH [https://www.ibh.de/]
+#
+# License:
+#   This program is free software; you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation; either version 2 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this package; if not, write to the Free Software
+#   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
+#
+
+use Data::Dumper;
+
+use Net::DHCP::Constants qw(:bootp_codes :dhcp_message :dho_codes :dhcp_other);
+use Net::DHCP::Packet;
+use Net::Pcap;
+
+use Getopt::Std;
+use POSIX qw(strftime);
+
+use warnings;
+use strict;
+
+use constant {
+    # record those DHCP Options on DHCPREQUESTs
+    SNOOPSET_RECORD_REQ => {
+        classid => DHO_VENDOR_CLASS_IDENTIFIER(),
+        hostname => DHO_HOST_NAME(),
+    },
+
+    # record those DHCP Options on DHCPACKs
+    SNOOPSET_RECORD_ACK => {
+        lease => DHO_DHCP_LEASE_TIME(),
+    },
+};
+
+# Getopts::Std stuff
+$Getopt::Std::STANDARD_HELP_VERSION++;
+my $err;
+my %opts = (
+    # where to listen for DHCP
+    i => pcap_lookupdev(\$err),
+
+    # where to put ip,mac tubles
+    s => "dhcp4_snoop",
+
+    # hook script directory to be called on DHCPACK's
+    h => undef,
+);
+
+$SIG{__WARN__} = \&logmsg;
+
+# usage info
+sub HELP_MESSAGE {
+    print STDERR <<HLP;
+Usage:
+
+  snoopset [-i <interface>] [-s <ipset>] [-h <hook.d>]
+
+    -i          snoop on interface
+                (default: $opts{i})
+    -s          ipset to be filled with ip,mac tuples
+                (default: $opts{s})
+    -h          directory with hook scripts run by run-parts(8)
+    -v          enable verbose mode
+
+    --help      show this help
+    --version   show version information
+
+HLP
+}
+
+
+# license info
+sub VERSION_MESSAGE {
+    print STDERR <<VER;
+
+snoopset 0.1 - DHCP snooping for ipset
+
+Authors:
+  Thomas Liske <liske\@ibh.de>
+
+Copyright Holder:
+  2018 - 2019 (C) IBH IT-Service GmbH [https://www.ibh.de/]
+
+Upstream:
+  https://github.com/DE-IBH/snoopset
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+VER
+}
+
+
+# format a log line
+sub logmsg {
+    my $msg = shift;
+    chomp($msg);
+    print STDERR strftime("%F %T ", localtime)."$msg\n";
+}
+
+
+# format a client description
+sub format_comment {
+    my $client = shift;
+
+    return ($client->{hostname} ? $client->{hostname} : "???").($client->{classid} ? "/$client->{classid}" : "");
+}
+
+
+# format the mac address
+sub format_hwaddr {
+    my $req = shift;
+    my $mac = substr($req->chaddr, 0, 2);
+    my $i = 2;
+
+    while($i < $req->hlen * 2) {
+        $mac .= ":" . substr($req->chaddr, $i, 2);
+        $i += 2;
+    }
+
+    return $mac;
+}
+
+
+# libpcap packet callback
+sub process_packet {
+    my ($clients, $hdr, $pkt) = @_;
+
+    # decode DHCP packet or drop if it is none (assuming Ethernet+IP+UDP header)
+    my $req = Net::DHCP::Packet->new(substr($pkt, DHCP_UDP_OVERHEAD));
+    unless($req->isDhcp) {
+        logmsg("Packet is not DHCP");
+        return;
+    }
+
+    # look for client=>server requests
+    if($req->op == BOOTREQUEST() && $req->getOptionValue(DHO_DHCP_MESSAGE_TYPE()) == DHCPREQUEST()) {
+        my $key = format_hwaddr($req);
+        $clients->{$key} = {} unless(exists($clients->{$key}));
+
+        # record selected option and packet values
+        foreach my $opt (keys %{(SNOOPSET_RECORD_REQ)}) {
+            $clients->{$key}{$opt} = $req->getOptionValue(SNOOPSET_RECORD_REQ->{$opt});
+        }
+        $clients->{$key}{hwaddr} = $key;
+        $clients->{$key}{updated} = $hdr->{tv_sec};
+
+        logmsg("DHCPREQUEST from $key [".format_comment($clients->{$key})."]");
+    }
+    # look for server=>client responses
+    elsif($req->op == BOOTREPLY() && $req->getOptionValue(DHO_DHCP_MESSAGE_TYPE()) == DHCPACK()) {
+        my $key = format_hwaddr($req);
+        $clients->{$key} = {} unless(exists($clients->{$key}));
+
+        # record selected option and packet values
+        foreach my $opt (keys %{(SNOOPSET_RECORD_ACK)}) {
+            $clients->{$key}{$opt} = $req->getOptionValue(SNOOPSET_RECORD_ACK->{$opt});
+        }
+        $clients->{$key}{hwaddr} = $key;
+        $clients->{$key}{ipaddr} = $req->yiaddr;
+        $clients->{$key}{updated} = $hdr->{tv_sec};
+
+        # add to ipset
+        my @args = (
+            "ipset",
+            "add",
+            $opts{s},
+            "$clients->{$key}{ipaddr},$key",
+            "-exist",
+            "timeout",
+            $clients->{$key}{lease},
+            "comment",
+            format_comment($clients->{$key})
+        );
+        logmsg("EXEC '".join(' ', @args)."'") if($opts{v});
+        system(@args);
+
+        logmsg("DHCPACK on $clients->{$key}{ipaddr} for $key [".format_comment($clients->{$key})."]");
+    }
+}
+
+
+# setup libpcap to look for DHCP packages
+sub snoop_packets {
+    my $err;
+
+    my $net;
+    my $mask;
+    pcap_lookupnet($opts{i}, \$net, \$mask, \$err);
+
+    my $pcap = pcap_open_live($opts{i}, -1, 0, 0, \$err);
+
+    my $filter;
+    pcap_compile($pcap, \$filter, "ip and udp port 67 and port 68", 1, $mask);
+
+    pcap_setfilter($pcap, $filter);
+
+    my %clients;
+    logmsg("Capturing on interface $opts{i}");
+    my $ret = pcap_loop($pcap, -1, \&process_packet, \%clients);
+    logmsg("EOL: $ret");
+    pcap_close($pcap);
+}
+
+
+# parse argv
+unless(getopts('i:s:h:v', \%opts)) {
+    HELP_MESSAGE();
+    exit(1);
+}
+
+# start capturing
+snoop_packets();
