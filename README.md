@@ -14,19 +14,20 @@ assigned via DHCP using ebtables or iptables rules. The housekeeping of the ipse
 - *ipset*
 
 
-## Preperation
+## Prerequisites
 
-You need to initialize the ipset for *snoopset*:
+You need to initialize an ipset for *snoopset*:
 
 ```console
 ipset create dhcp4_snoop hash:ip,mac family inet hashsize 4096 maxelem 65536 timeout 14400 counters comment forceadd
 ```
 
-Required features:
-- **`comment`** (*required*) - will contain the client's hostname and classid
-- **`timeout`** (*required*) - ipset's timeout feature is used for housekeeping - you might use your default DHCP lease time
+You need to enable the following **required** features:
+- `comment` - will contain the client's hostname and classid
+- `timeout` - ipset's timeout feature is used for housekeeping - you might use your default DHCP maximum lease time
 
 For the other optional features see also *ipset(8)*.
+
 
 ## Installation
 
@@ -39,5 +40,12 @@ On Debian systems all dependencies are available as packages:
 ```
 
 ### Docker
+
+There is a [*Dockerfile*](Dockerfile) in the source repository to build the container image. A pre-build container image is available at [docker hub](https://hub.docker.com/r/ibhde/snoopset). 
+
+
+## Usage
+
+### ebtables
 
 *TBD*
