@@ -1,0 +1,10 @@
+# example docker-compose file
+version: '3'
+services:
+  bird:
+    image: ibhde/snoopset
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    network_mode: host
+    command: ["-i", "eno1"]
