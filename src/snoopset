@@ -70,11 +70,12 @@ sub HELP_MESSAGE {
     print STDERR <<HLP;
 Usage:
 
-  snoopset [-i <interface>] [-s <ipset>] [-h <hook.d>]
+  snoopset [-i <interface>] [-r] [-s <ipset>] [-h <hook.d>]
 
-    -i          snoop on interface
+    -i <if>     snoop on interface
                 (default: $opts{i})
-    -s          ipset to be filled with ip,mac tuples
+    -r          capture packet from DHCP relay agent
+    -s <set>    ipset to be filled with ip,mac tuples
                 (default: $opts{s})
     -h          directory with hook scripts run by run-parts(8)
     -v          enable verbose mode
@@ -210,12 +211,17 @@ sub snoop_packets {
     my $pcap = pcap_open_live($opts{i}, -1, 0, 0, \$err);
 
     my $filter;
-    pcap_compile($pcap, \$filter, "ip and udp port 67 and port 68", 1, $mask);
+    if($opts{r}) {
+        pcap_compile($pcap, \$filter, "ip and udp dst port 67 and src port 67", 1, $mask);
+    }
+    else {
+        pcap_compile($pcap, \$filter, "ip and udp port 67 and port 68", 1, $mask);
+    }
 
     pcap_setfilter($pcap, $filter);
 
     my %clients;
-    logmsg("Capturing on interface $opts{i}");
+    logmsg("Capturing on interface $opts{i}".($opts{r} ? " (DHCP relay mode)": ""));
     my $ret = pcap_loop($pcap, -1, \&process_packet, \%clients);
     logmsg("EOL: $ret");
     pcap_close($pcap);
@@ -223,7 +229,7 @@ sub snoop_packets {
 
 
 # parse argv
-unless(getopts('i:s:h:v', \%opts)) {
+unless(getopts('i:s:h:rv', \%opts)) {
     HELP_MESSAGE();
     exit(1);
 }
